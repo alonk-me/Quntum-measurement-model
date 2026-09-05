@@ -355,7 +355,13 @@ class TestSimulateZ2Ensemble:
         assert np.isnan(out)
 
 
-class TestStableIntegrator:
+class TestLegacyDirectCorrelationIntegrator:
+    """Regression tests for the superseded direct-G path.
+
+    Interior eigenvalues and repair behavior checked here are legacy behavior,
+    not acceptance criteria for the pure orbital/QR trajectory implementation.
+    """
+
     @pytest.mark.parametrize("L", [8, 16, 32])
     @pytest.mark.parametrize("gamma", [0.5, 2.0, 5.0])
     def test_z2_not_saturated(self, L, gamma):
@@ -438,6 +444,7 @@ class TestStableIntegrator:
         assert diff < 1e-8
 
     def test_no_mixed_state_drift(self):
+        """Keep the historical mixed-state drift metric as a regression only."""
         gamma = 2.0
         dt = 1e-3
         n_steps = 500
