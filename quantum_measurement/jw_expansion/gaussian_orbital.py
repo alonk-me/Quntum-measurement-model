@@ -233,6 +233,258 @@ def deterministic_phase_qr(
     return q_matrix, r_matrix
 
 
+def _right_solve(values: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """Return ``values @ inv(matrix)`` using a batched linear solve."""
+
+    return np.swapaxes(
+        np.linalg.solve(
+            np.swapaxes(matrix, -2, -1), np.swapaxes(values, -2, -1)
+        ),
+        -2,
+        -1,
+    )
+
+
+def deterministic_phase_qr_second_order(
+    raw_orbitals: np.ndarray,
+    first_raw_tangent: np.ndarray,
+    second_raw_tangent: np.ndarray,
+    *,
+    diagonal_tolerance: float = 1.0e-14,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Differentiate deterministic-phase reduced QR through second order.
+
+    The inputs are a matrix path ``A``, ``A_theta``, and
+    ``A_theta_theta``.  The outputs are ``Q``, its two tangents, ``R``, and
+    its two tangents in the positive-real-diagonal gauge.  The derivation uses
+    ``A=Q R``, the differentiated orthonormality constraints, and the fact that
+    ``R``, ``R_theta``, and ``R_theta_theta`` are upper triangular with real
+    diagonals.
+    """
+
+    raw_orbitals = np.asarray(raw_orbitals, dtype=complex)
+    first_raw_tangent = np.asarray(first_raw_tangent, dtype=complex)
+    second_raw_tangent = np.asarray(second_raw_tangent, dtype=complex)
+    if (
+        first_raw_tangent.shape != raw_orbitals.shape
+        or second_raw_tangent.shape != raw_orbitals.shape
+    ):
+        raise ValueError("raw orbital and tangent shapes must match")
+
+    q_matrix, r_matrix = deterministic_phase_qr(
+        raw_orbitals, diagonal_tolerance=diagonal_tolerance
+    )
+    q_adjoint = np.swapaxes(q_matrix.conj(), -2, -1)
+    first_reduced = _right_solve(q_adjoint @ first_raw_tangent, r_matrix)
+    first_gauge = np.zeros_like(first_reduced)
+    diagonal_indices = np.arange(r_matrix.shape[-1])
+    first_gauge[..., diagonal_indices, diagonal_indices] = 1.0j * np.imag(
+        np.diagonal(first_reduced, axis1=-2, axis2=-1)
+    )
+    for row in range(1, r_matrix.shape[-1]):
+        for column in range(row):
+            first_gauge[..., row, column] = first_reduced[..., row, column]
+            first_gauge[..., column, row] = -np.conj(
+                first_reduced[..., row, column]
+            )
+    first_r_tangent = (first_reduced - first_gauge) @ r_matrix
+    first_q_tangent = _right_solve(
+        first_raw_tangent - q_matrix @ first_r_tangent, r_matrix
+    )
+
+    second_source = (
+        second_raw_tangent - 2.0 * first_q_tangent @ first_r_tangent
+    )
+    second_reduced = _right_solve(q_adjoint @ second_source, r_matrix)
+    hermitian_part = -(
+        np.swapaxes(first_q_tangent.conj(), -2, -1) @ first_q_tangent
+    )
+    hermitian_part = 0.5 * (
+        hermitian_part + np.swapaxes(hermitian_part.conj(), -2, -1)
+    )
+    second_gauge = np.zeros_like(second_reduced)
+    second_gauge[..., diagonal_indices, diagonal_indices] = 1.0j * np.imag(
+        np.diagonal(second_reduced, axis1=-2, axis2=-1)
+    )
+    for row in range(1, r_matrix.shape[-1]):
+        for column in range(row):
+            lower = (
+                second_reduced[..., row, column]
+                - hermitian_part[..., row, column]
+            )
+            second_gauge[..., row, column] = lower
+            second_gauge[..., column, row] = -np.conj(lower)
+    second_q_overlap = hermitian_part + second_gauge
+    second_r_tangent = (second_reduced - second_q_overlap) @ r_matrix
+    second_q_tangent = _right_solve(
+        second_source - q_matrix @ second_r_tangent, r_matrix
+    )
+    return (
+        q_matrix,
+        first_q_tangent,
+        second_q_tangent,
+        r_matrix,
+        first_r_tangent,
+        second_r_tangent,
+    )
+
+
+def covariance_tangents_from_orbitals(
+    orbitals: np.ndarray,
+    first_orbital_tangent: np.ndarray,
+    second_orbital_tangent: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Construct ``G``, ``F=G_theta``, and ``F2=G_theta_theta``."""
+
+    orbitals = np.asarray(orbitals, dtype=complex)
+    first_orbital_tangent = np.asarray(first_orbital_tangent, dtype=complex)
+    second_orbital_tangent = np.asarray(second_orbital_tangent, dtype=complex)
+    if (
+        first_orbital_tangent.shape != orbitals.shape
+        or second_orbital_tangent.shape != orbitals.shape
+    ):
+        raise ValueError("orbital and tangent shapes must match")
+    adjoint = np.swapaxes(orbitals.conj(), -2, -1)
+    first_adjoint = np.swapaxes(first_orbital_tangent.conj(), -2, -1)
+    second_adjoint = np.swapaxes(second_orbital_tangent.conj(), -2, -1)
+    covariance = orbitals @ adjoint
+    first_covariance = first_orbital_tangent @ adjoint + orbitals @ first_adjoint
+    second_covariance = (
+        second_orbital_tangent @ adjoint
+        + 2.0 * first_orbital_tangent @ first_adjoint
+        + orbitals @ second_adjoint
+    )
+    return covariance, first_covariance, second_covariance
+
+
+def apply_orbital_hamiltonian_map(
+    orbital_map: np.ndarray,
+    orbitals: np.ndarray,
+    first_orbital_tangent: np.ndarray,
+    second_orbital_tangent: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Apply the gamma-independent Hamiltonian map to all tangent orders."""
+
+    orbital_map = np.asarray(orbital_map, dtype=complex)
+    orbitals = np.asarray(orbitals, dtype=complex)
+    first_orbital_tangent = np.asarray(first_orbital_tangent, dtype=complex)
+    second_orbital_tangent = np.asarray(second_orbital_tangent, dtype=complex)
+    if (
+        first_orbital_tangent.shape != orbitals.shape
+        or second_orbital_tangent.shape != orbitals.shape
+    ):
+        raise ValueError("orbital and tangent shapes must match")
+    if orbital_map.shape != (orbitals.shape[-2], orbitals.shape[-2]):
+        raise ValueError("orbital_map shape is incompatible with orbitals")
+    return (
+        orbital_map @ orbitals,
+        orbital_map @ first_orbital_tangent,
+        orbital_map @ second_orbital_tangent,
+    )
+
+
+def measurement_qr_tangent_step(
+    orbitals: np.ndarray,
+    first_orbital_tangent: np.ndarray,
+    second_orbital_tangent: np.ndarray,
+    noise_step: np.ndarray,
+    epsilon: float,
+    *,
+    diagonal_tolerance: float = 1.0e-14,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Apply the diagonal measurement map and its deterministic QR tangents."""
+
+    if not np.isfinite(epsilon) or epsilon <= 0.0:
+        raise ValueError("epsilon must be positive and finite")
+    orbitals = np.asarray(orbitals, dtype=complex)
+    first_orbital_tangent = np.asarray(first_orbital_tangent, dtype=complex)
+    second_orbital_tangent = np.asarray(second_orbital_tangent, dtype=complex)
+    if orbitals.shape[-2] != 2 * orbitals.shape[-1]:
+        raise ValueError("orbitals must have shape (..., 2L, L)")
+    if (
+        first_orbital_tangent.shape != orbitals.shape
+        or second_orbital_tangent.shape != orbitals.shape
+    ):
+        raise ValueError("orbital and tangent shapes must match")
+    L = orbitals.shape[-1]
+    expected_noise_shape = orbitals.shape[:-2] + (L,)
+    noise_step = np.asarray(noise_step, dtype=float)
+    if noise_step.shape != expected_noise_shape or not np.all(np.isfinite(noise_step)):
+        raise ValueError(f"noise_step must be finite with shape {expected_noise_shape}")
+
+    covariance, first_covariance, second_covariance = (
+        covariance_tangents_from_orbitals(
+            orbitals, first_orbital_tangent, second_orbital_tangent
+        )
+    )
+    z = 1.0 - 2.0 * np.real(
+        np.diagonal(covariance, axis1=-2, axis2=-1)[..., :L]
+    )
+    first_z = -2.0 * np.real(
+        np.diagonal(first_covariance, axis1=-2, axis2=-1)[..., :L]
+    )
+    second_z = -2.0 * np.real(
+        np.diagonal(second_covariance, axis1=-2, axis2=-1)[..., :L]
+    )
+    epsilon_squared = epsilon * epsilon
+    measurement_parameter = 0.5 * (
+        epsilon * noise_step + epsilon_squared * z
+    )
+    first_measurement_parameter = 0.5 * (
+        0.5 * epsilon * noise_step + epsilon_squared * (z + first_z)
+    )
+    second_measurement_parameter = 0.5 * (
+        0.25 * epsilon * noise_step
+        + epsilon_squared * (z + 2.0 * first_z + second_z)
+    )
+    log_diagonal = np.concatenate(
+        (-2.0 * measurement_parameter, 2.0 * measurement_parameter), axis=-1
+    )
+    first_log_diagonal = np.concatenate(
+        (-2.0 * first_measurement_parameter, 2.0 * first_measurement_parameter),
+        axis=-1,
+    )
+    second_log_diagonal = np.concatenate(
+        (-2.0 * second_measurement_parameter, 2.0 * second_measurement_parameter),
+        axis=-1,
+    )
+    diagonal = np.exp(log_diagonal)
+    raw_orbitals = diagonal[..., np.newaxis] * orbitals
+    first_raw_tangent = diagonal[..., np.newaxis] * (
+        first_orbital_tangent
+        + first_log_diagonal[..., np.newaxis] * orbitals
+    )
+    second_raw_tangent = diagonal[..., np.newaxis] * (
+        second_orbital_tangent
+        + 2.0 * first_log_diagonal[..., np.newaxis]
+        * first_orbital_tangent
+        + (
+            np.square(first_log_diagonal) + second_log_diagonal
+        )[..., np.newaxis]
+        * orbitals
+    )
+    return deterministic_phase_qr_second_order(
+        raw_orbitals,
+        first_raw_tangent,
+        second_raw_tangent,
+        diagonal_tolerance=diagonal_tolerance,
+    )
+
+
 def _default_occupied_state(L: int) -> np.ndarray:
     state = np.zeros(2**L, dtype=complex)
     state[-1] = 1.0
@@ -438,6 +690,150 @@ class GaussianChainResult:
 
 
 @dataclass(frozen=True)
+class GaussianChainSecondOrderHistory:
+    """Optional pathwise state and derivative observables for validation."""
+
+    z: np.ndarray
+    u: np.ndarray
+    v: np.ndarray
+
+    def __post_init__(self) -> None:
+        z = _readonly(self.z, ndim=3, name="z")
+        u = _readonly(self.u, ndim=3, name="u")
+        v = _readonly(self.v, ndim=3, name="v")
+        if u.shape != z.shape or v.shape != z.shape:
+            raise ValueError("z, u, and v histories must have matching shapes")
+        object.__setattr__(self, "z", z)
+        object.__setattr__(self, "u", u)
+        object.__setattr__(self, "v", v)
+
+
+@dataclass(frozen=True)
+class GaussianChainSecondOrderResult:
+    """Trajectory-resolved AoT and orbital tangents with respect to log gamma.
+
+    Three-column diagnostic arrays are ordered by derivative order: physical
+    state, first tangent, and second tangent.  The orbital matrices are the
+    occupied block ``V=U@P`` from the specification; storing the unused
+    complementary gauge of ``U`` would not change ``G=V@V.conj().T``.
+    """
+
+    q: np.ndarray
+    dq_dtheta: np.ndarray
+    d2q_dtheta2: np.ndarray
+    Q: np.ndarray
+    dQ_dtheta: np.ndarray
+    d2Q_dtheta2: np.ndarray
+    final_z: np.ndarray
+    final_u: np.ndarray
+    final_v: np.ndarray
+    final_orbitals: np.ndarray
+    final_first_orbital_tangent: np.ndarray
+    final_second_orbital_tangent: np.ndarray
+    final_covariance: np.ndarray
+    final_first_covariance: np.ndarray
+    final_second_covariance: np.ndarray
+    max_hermiticity_residual: np.ndarray
+    max_particle_hole_residual: np.ndarray
+    max_projector_residual: np.ndarray
+    max_orbital_constraint_residual: np.ndarray
+    max_first_tangent_norm: np.ndarray
+    max_second_tangent_norm: np.ndarray
+    minimum_qr_diagonal: np.ndarray
+    repair_count: np.ndarray
+    gamma: float
+    J: float
+    dt: float
+    averaging_time: float
+    n_burnin: int
+    n_samples: int
+    boundary: str
+    parity: int
+    noise_kind: str
+    noise_shape: tuple[int, int, int]
+    noise_dtype: str
+    noise_hash: str
+    seed: Optional[int]
+    derivative_parameter: str
+    requested_integrator: str
+    integrator: str
+    repair_policy: str
+    repair_fired: bool
+    fallback_fired: bool
+    clipping_fired: bool
+
+    def __post_init__(self) -> None:
+        n_trajectories, _, L = self.noise_shape
+        for name in (
+            "q",
+            "dq_dtheta",
+            "d2q_dtheta2",
+            "Q",
+            "dQ_dtheta",
+            "d2Q_dtheta2",
+            "max_first_tangent_norm",
+            "max_second_tangent_norm",
+            "minimum_qr_diagonal",
+            "repair_count",
+        ):
+            values = _readonly(getattr(self, name), ndim=1, name=name)
+            if values.shape != (n_trajectories,):
+                raise ValueError(f"{name} must have shape ({n_trajectories},)")
+            object.__setattr__(self, name, values)
+        for name in ("final_z", "final_u", "final_v"):
+            values = _readonly(getattr(self, name), ndim=2, name=name)
+            if values.shape != (n_trajectories, L):
+                raise ValueError(f"{name} must have shape ({n_trajectories}, {L})")
+            object.__setattr__(self, name, values)
+        for name in (
+            "final_orbitals",
+            "final_first_orbital_tangent",
+            "final_second_orbital_tangent",
+        ):
+            values = _readonly(getattr(self, name), ndim=3, name=name)
+            if values.shape != (n_trajectories, 2 * L, L):
+                raise ValueError(
+                    f"{name} must have shape ({n_trajectories}, {2 * L}, {L})"
+                )
+            object.__setattr__(self, name, values)
+        for name in (
+            "final_covariance",
+            "final_first_covariance",
+            "final_second_covariance",
+        ):
+            values = _readonly(getattr(self, name), ndim=3, name=name)
+            if values.shape != (n_trajectories, 2 * L, 2 * L):
+                raise ValueError(
+                    f"{name} must have shape ({n_trajectories}, {2 * L}, {2 * L})"
+                )
+            object.__setattr__(self, name, values)
+        for name in (
+            "max_hermiticity_residual",
+            "max_particle_hole_residual",
+            "max_projector_residual",
+            "max_orbital_constraint_residual",
+        ):
+            values = _readonly(getattr(self, name), ndim=2, name=name)
+            if values.shape != (n_trajectories, 3):
+                raise ValueError(f"{name} must have shape ({n_trajectories}, 3)")
+            object.__setattr__(self, name, values)
+
+    @property
+    def n_trajectories(self) -> int:
+        return self.noise_shape[0]
+
+    @property
+    def L(self) -> int:
+        return self.noise_shape[2]
+
+    @property
+    def log_g(self) -> float:
+        if self.J <= 0.0:
+            raise ValueError("log(g) metadata is undefined when J=0")
+        return float(np.log(self.gamma / (4.0 * self.J)))
+
+
+@dataclass(frozen=True)
 class GaussianStationarityDiagnostics:
     """Window and autocorrelation diagnostics for trajectory-resolved ``z**2``.
 
@@ -636,6 +1032,108 @@ def _covariance_diagnostics(
     return np.stack(
         (hermiticity, particle_hole, projector, trace, eigenvalue), axis=-1
     )
+
+
+def _second_order_invariant_diagnostics(
+    covariance: np.ndarray,
+    first_covariance: np.ndarray,
+    second_covariance: np.ndarray,
+    orbitals: np.ndarray,
+    first_orbital_tangent: np.ndarray,
+    second_orbital_tangent: np.ndarray,
+    tau_x: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return residuals ordered as state, first tangent, second tangent."""
+
+    def adjoint(values: np.ndarray) -> np.ndarray:
+        return np.swapaxes(values.conj(), -2, -1)
+
+    identity_covariance = np.eye(covariance.shape[-1], dtype=complex)
+    identity_orbital = np.eye(orbitals.shape[-1], dtype=complex)
+
+    hermiticity = np.stack(
+        [
+            np.linalg.norm(values - adjoint(values), axis=(-2, -1))
+            for values in (covariance, first_covariance, second_covariance)
+        ],
+        axis=-1,
+    )
+    particle_hole = np.stack(
+        (
+            np.linalg.norm(
+                tau_x @ covariance.conj() @ tau_x
+                + covariance
+                - identity_covariance,
+                axis=(-2, -1),
+            ),
+            np.linalg.norm(
+                tau_x @ first_covariance.conj() @ tau_x + first_covariance,
+                axis=(-2, -1),
+            ),
+            np.linalg.norm(
+                tau_x @ second_covariance.conj() @ tau_x + second_covariance,
+                axis=(-2, -1),
+            ),
+        ),
+        axis=-1,
+    )
+    projector = np.stack(
+        (
+            np.linalg.norm(
+                covariance @ covariance - covariance, axis=(-2, -1)
+            ),
+            np.linalg.norm(
+                covariance @ first_covariance
+                + first_covariance @ covariance
+                - first_covariance,
+                axis=(-2, -1),
+            ),
+            np.linalg.norm(
+                covariance @ second_covariance
+                + second_covariance @ covariance
+                + 2.0 * first_covariance @ first_covariance
+                - second_covariance,
+                axis=(-2, -1),
+            ),
+        ),
+        axis=-1,
+    )
+    orbital_adjoint = adjoint(orbitals)
+    first_orbital_adjoint = adjoint(first_orbital_tangent)
+    second_orbital_adjoint = adjoint(second_orbital_tangent)
+    orbital_constraints = np.stack(
+        (
+            np.linalg.norm(
+                orbital_adjoint @ orbitals - identity_orbital, axis=(-2, -1)
+            ),
+            np.linalg.norm(
+                orbital_adjoint @ first_orbital_tangent
+                + first_orbital_adjoint @ orbitals,
+                axis=(-2, -1),
+            ),
+            np.linalg.norm(
+                orbital_adjoint @ second_orbital_tangent
+                + second_orbital_adjoint @ orbitals
+                + 2.0 * first_orbital_adjoint @ first_orbital_tangent,
+                axis=(-2, -1),
+            ),
+        ),
+        axis=-1,
+    )
+    return hermiticity, particle_hole, projector, orbital_constraints
+
+
+def _z_tangents_from_covariances(
+    covariance: np.ndarray,
+    first_covariance: np.ndarray,
+    second_covariance: np.ndarray,
+    L: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    diagonals = [
+        np.real(np.diagonal(values, axis1=-2, axis2=-1)[..., :L])
+        for values in (covariance, first_covariance, second_covariance)
+    ]
+    return 1.0 - 2.0 * diagonals[0], -2.0 * diagonals[1], -2.0 * diagonals[2]
 
 
 def _make_result(
@@ -912,3 +1410,252 @@ def simulate_gaussian_orbital_chain(
         integrator="pure_gaussian_orbital_exponential_split_v1",
         covariance_history=covariance_history,
     )
+
+
+def simulate_gaussian_orbital_chain_second_order(
+    *,
+    L: int,
+    gamma: float,
+    J: float,
+    dt: float,
+    n_burnin: int,
+    n_samples: int,
+    boundary: str,
+    n_trajectories: int = 1,
+    initial_state: Optional[np.ndarray] = None,
+    noise: Optional[np.ndarray] = None,
+    seed: Optional[int] = None,
+    store_history: bool = False,
+) -> tuple[
+    GaussianChainSecondOrderResult, Optional[GaussianChainSecondOrderHistory]
+]:
+    """Propagate the direct first and second ``log(gamma)`` orbital tangents.
+
+    The implementation differentiates the exact Hamiltonian map, the
+    frozen-coefficient exponential measurement map, and deterministic-phase QR.
+    Primitive noise, ``J``, ``dt``, initial state, burn-in, and sampling window
+    are fixed.  Finite differences are not used by this estimator.  The
+    equations and QR gauge are defined in Section 9.2 of
+    ``docs/derivative/aot_second_derivative_v3.md``.
+    """
+
+    n_burnin, n_samples, n_trajectories, boundary = _validate_protocol(
+        L=L,
+        gamma=gamma,
+        J=J,
+        dt=dt,
+        n_burnin=n_burnin,
+        n_samples=n_samples,
+        n_trajectories=n_trajectories,
+        boundary=boundary,
+    )
+    state0 = _normalize_state(initial_state, L)
+    parity = _state_parity(state0, L)
+    covariance0 = nambu_covariance_from_state(state0, L)
+    if np.linalg.norm(covariance0 @ covariance0 - covariance0, ord="fro") > 1.0e-10:
+        raise ValueError("initial_state is not a pure Gaussian state")
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance0)
+    occupied = eigenvectors[:, eigenvalues > 0.5]
+    if occupied.shape != (2 * L, L):
+        raise ValueError("initial covariance does not have rank L")
+    occupied, _ = deterministic_phase_qr(occupied)
+
+    n_steps = n_burnin + n_samples
+    noise, recorded_seed = _resolve_gaussian_noise(
+        noise=noise,
+        seed=seed,
+        n_trajectories=n_trajectories,
+        n_steps=n_steps,
+        L=L,
+    )
+    n_trajectories = noise.shape[0]
+    orbitals = np.broadcast_to(occupied, (n_trajectories, 2 * L, L)).copy()
+    first_orbital_tangent = np.zeros_like(orbitals)
+    second_orbital_tangent = np.zeros_like(orbitals)
+    bdg_hamiltonian = ising_bdg_hamiltonian(L, J, boundary, parity=parity)
+    orbital_hamiltonian_map = expm(1.0j * bdg_hamiltonian * dt)
+    tau_x = particle_hole_swap(L)
+    epsilon = np.sqrt(gamma * dt)
+
+    history = None
+    if store_history:
+        z_history = np.empty((n_trajectories, n_steps + 1, L), dtype=float)
+        u_history = np.empty_like(z_history)
+        v_history = np.empty_like(z_history)
+
+    q_sum = np.zeros(n_trajectories, dtype=float)
+    first_q_sum = np.zeros(n_trajectories, dtype=float)
+    second_q_sum = np.zeros(n_trajectories, dtype=float)
+    maximum_hermiticity = np.zeros((n_trajectories, 3), dtype=float)
+    maximum_particle_hole = np.zeros((n_trajectories, 3), dtype=float)
+    maximum_projector = np.zeros((n_trajectories, 3), dtype=float)
+    maximum_orbital_constraint = np.zeros((n_trajectories, 3), dtype=float)
+    maximum_first_tangent_norm = np.zeros(n_trajectories, dtype=float)
+    maximum_second_tangent_norm = np.zeros(n_trajectories, dtype=float)
+    minimum_qr_diagonal = np.full(n_trajectories, np.inf, dtype=float)
+
+    covariance, first_covariance, second_covariance = (
+        covariance_tangents_from_orbitals(
+            orbitals, first_orbital_tangent, second_orbital_tangent
+        )
+    )
+    z, first_z, second_z = _z_tangents_from_covariances(
+        covariance, first_covariance, second_covariance, L
+    )
+    if store_history:
+        z_history[:, 0, :] = z
+        u_history[:, 0, :] = first_z
+        v_history[:, 0, :] = second_z
+    diagnostics = _second_order_invariant_diagnostics(
+        covariance,
+        first_covariance,
+        second_covariance,
+        orbitals,
+        first_orbital_tangent,
+        second_orbital_tangent,
+        tau_x,
+    )
+    for maximum, current in zip(
+        (
+            maximum_hermiticity,
+            maximum_particle_hole,
+            maximum_projector,
+            maximum_orbital_constraint,
+        ),
+        diagnostics,
+    ):
+        maximum[:, :] = current
+
+    for step in range(n_steps):
+        hamiltonian_outputs = apply_orbital_hamiltonian_map(
+            orbital_hamiltonian_map,
+            orbitals,
+            first_orbital_tangent,
+            second_orbital_tangent,
+        )
+        (
+            next_orbitals,
+            next_first_tangent,
+            next_second_tangent,
+            r_matrix,
+            _,
+            _,
+        ) = measurement_qr_tangent_step(
+            *hamiltonian_outputs, noise[:, step, :], epsilon
+        )
+        orbitals = next_orbitals
+        first_orbital_tangent = next_first_tangent
+        second_orbital_tangent = next_second_tangent
+
+        minimum_qr_diagonal = np.minimum(
+            minimum_qr_diagonal,
+            np.min(np.abs(np.diagonal(r_matrix, axis1=-2, axis2=-1)), axis=-1),
+        )
+        maximum_first_tangent_norm = np.maximum(
+            maximum_first_tangent_norm,
+            np.linalg.norm(first_orbital_tangent, axis=(-2, -1)),
+        )
+        maximum_second_tangent_norm = np.maximum(
+            maximum_second_tangent_norm,
+            np.linalg.norm(second_orbital_tangent, axis=(-2, -1)),
+        )
+        covariance, first_covariance, second_covariance = (
+            covariance_tangents_from_orbitals(
+                orbitals, first_orbital_tangent, second_orbital_tangent
+            )
+        )
+        z, first_z, second_z = _z_tangents_from_covariances(
+            covariance, first_covariance, second_covariance, L
+        )
+        if store_history:
+            z_history[:, step + 1, :] = z
+            u_history[:, step + 1, :] = first_z
+            v_history[:, step + 1, :] = second_z
+        diagnostics = _second_order_invariant_diagnostics(
+            covariance,
+            first_covariance,
+            second_covariance,
+            orbitals,
+            first_orbital_tangent,
+            second_orbital_tangent,
+            tau_x,
+        )
+        for maximum, current in zip(
+            (
+                maximum_hermiticity,
+                maximum_particle_hole,
+                maximum_projector,
+                maximum_orbital_constraint,
+            ),
+            diagnostics,
+        ):
+            maximum[:, :] = np.maximum(maximum, current)
+
+        if step >= n_burnin:
+            q_sum += np.mean(1.0 + np.square(z), axis=1)
+            first_q_sum += np.mean(2.0 * z * first_z, axis=1)
+            second_q_sum += np.mean(
+                2.0 * (np.square(first_z) + z * second_z), axis=1
+            )
+
+    q = q_sum / n_samples
+    first_q = first_q_sum / n_samples
+    second_q = second_q_sum / n_samples
+    averaging_time = n_samples * dt
+    prefactor = gamma * L * averaging_time
+    extensive_q = prefactor * q
+    first_extensive_q = prefactor * (q + first_q)
+    second_extensive_q = prefactor * (q + 2.0 * first_q + second_q)
+    repair_count = np.zeros(n_trajectories, dtype=int)
+    result = GaussianChainSecondOrderResult(
+        q=q,
+        dq_dtheta=first_q,
+        d2q_dtheta2=second_q,
+        Q=extensive_q,
+        dQ_dtheta=first_extensive_q,
+        d2Q_dtheta2=second_extensive_q,
+        final_z=z,
+        final_u=first_z,
+        final_v=second_z,
+        final_orbitals=orbitals,
+        final_first_orbital_tangent=first_orbital_tangent,
+        final_second_orbital_tangent=second_orbital_tangent,
+        final_covariance=covariance,
+        final_first_covariance=first_covariance,
+        final_second_covariance=second_covariance,
+        max_hermiticity_residual=maximum_hermiticity,
+        max_particle_hole_residual=maximum_particle_hole,
+        max_projector_residual=maximum_projector,
+        max_orbital_constraint_residual=maximum_orbital_constraint,
+        max_first_tangent_norm=maximum_first_tangent_norm,
+        max_second_tangent_norm=maximum_second_tangent_norm,
+        minimum_qr_diagonal=minimum_qr_diagonal,
+        repair_count=repair_count,
+        gamma=float(gamma),
+        J=float(J),
+        dt=float(dt),
+        averaging_time=float(averaging_time),
+        n_burnin=n_burnin,
+        n_samples=n_samples,
+        boundary=boundary,
+        parity=parity,
+        noise_kind="standard_normal",
+        noise_shape=noise.shape,
+        noise_dtype=str(noise.dtype),
+        noise_hash=_noise_hash(noise),
+        seed=recorded_seed,
+        derivative_parameter="log_gamma_at_fixed_J",
+        requested_integrator="pure_gaussian_orbital_exponential_split_v1",
+        integrator="pure_gaussian_orbital_exponential_split_v1_direct_tangent_v1",
+        repair_policy="none",
+        repair_fired=False,
+        fallback_fired=False,
+        clipping_fired=False,
+    )
+    if store_history:
+        history = GaussianChainSecondOrderHistory(
+            z=z_history,
+            u=u_history,
+            v=v_history,
+        )
+    return result, history
