@@ -364,6 +364,66 @@ def covariance_tangents_from_orbitals(
     return covariance, first_covariance, second_covariance
 
 
+def gaussian_tangent_growth_metrics(
+    orbitals: np.ndarray,
+    first_orbital_tangent: np.ndarray,
+    second_orbital_tangent: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Separate orbital-coordinate growth from physical covariance growth.
+
+    This is a read-only diagnostic of the accepted orbital tangent state.  It
+    does not rotate, project, clip, or otherwise repair the propagated
+    tangents.  Large orbital norms accompanied by small covariance norms and a
+    large second-order cancellation ratio indicate coordinate/gauge
+    amplification.  Growth in ``F2`` itself is physical pathwise sensitivity
+    (or loss of floating-point accuracy in its gauge cancellation) and must be
+    checked against a common-noise reference.
+    """
+
+    covariance, first_covariance, second_covariance = (
+        covariance_tangents_from_orbitals(
+            orbitals, first_orbital_tangent, second_orbital_tangent
+        )
+    )
+    orbital_adjoint = np.swapaxes(orbitals.conj(), -2, -1)
+    first_overlap = orbital_adjoint @ first_orbital_tangent
+    second_overlap = orbital_adjoint @ second_orbital_tangent
+    first_horizontal = first_orbital_tangent - orbitals @ first_overlap
+    second_horizontal = second_orbital_tangent - orbitals @ second_overlap
+    first_adjoint = np.swapaxes(first_orbital_tangent.conj(), -2, -1)
+    second_adjoint = np.swapaxes(second_orbital_tangent.conj(), -2, -1)
+    second_linear = (
+        second_orbital_tangent @ orbital_adjoint
+        + orbitals @ second_adjoint
+    )
+    second_quadratic = 2.0 * first_orbital_tangent @ first_adjoint
+
+    def norm(values: np.ndarray) -> np.ndarray:
+        return np.linalg.norm(values, axis=(-2, -1))
+
+    linear_norm = norm(second_linear)
+    quadratic_norm = norm(second_quadratic)
+    second_covariance_norm = norm(second_covariance)
+    cancellation_scale = linear_norm + quadratic_norm
+    cancellation_ratio = np.divide(
+        cancellation_scale,
+        np.maximum(second_covariance_norm, np.finfo(float).tiny),
+    )
+    return {
+        "first_orbital_norm": norm(first_orbital_tangent),
+        "second_orbital_norm": norm(second_orbital_tangent),
+        "first_covariance_norm": norm(first_covariance),
+        "second_covariance_norm": second_covariance_norm,
+        "first_within_occupied_norm": norm(first_overlap),
+        "first_horizontal_norm": norm(first_horizontal),
+        "second_within_occupied_norm": norm(second_overlap),
+        "second_horizontal_norm": norm(second_horizontal),
+        "second_covariance_linear_norm": linear_norm,
+        "second_covariance_quadratic_norm": quadratic_norm,
+        "second_covariance_cancellation_ratio": cancellation_ratio,
+    }
+
+
 def apply_orbital_hamiltonian_map(
     orbital_map: np.ndarray,
     orbitals: np.ndarray,
@@ -690,12 +750,73 @@ class GaussianChainResult:
 
 
 @dataclass(frozen=True)
+class GaussianChainTangentGrowthHistory:
+    """Gauge and physical tangent diagnostics sampled after every split step.
+
+    ``within_occupied`` and ``horizontal`` refer to the decomposition
+    ``V_k = V (V^dagger V_k) + (I-G) V_k``.  At first order the
+    within-occupied component is the orbital gauge direction when the tangent
+    constraint is satisfied.  At second order it also contains the required
+    normalization curvature, so the covariance norms and cancellation ratio
+    are the gauge-invariant discriminants.
+    """
+
+    first_orbital_norm: np.ndarray
+    second_orbital_norm: np.ndarray
+    first_covariance_norm: np.ndarray
+    second_covariance_norm: np.ndarray
+    first_within_occupied_norm: np.ndarray
+    first_horizontal_norm: np.ndarray
+    second_within_occupied_norm: np.ndarray
+    second_horizontal_norm: np.ndarray
+    second_covariance_linear_norm: np.ndarray
+    second_covariance_quadratic_norm: np.ndarray
+    second_covariance_cancellation_ratio: np.ndarray
+    minimum_qr_diagonal: np.ndarray
+    invariant_residuals: np.ndarray
+
+    def __post_init__(self) -> None:
+        first = _readonly(
+            self.first_orbital_norm, ndim=2, name="first_orbital_norm"
+        )
+        object.__setattr__(self, "first_orbital_norm", first)
+        for name in (
+            "second_orbital_norm",
+            "first_covariance_norm",
+            "second_covariance_norm",
+            "first_within_occupied_norm",
+            "first_horizontal_norm",
+            "second_within_occupied_norm",
+            "second_horizontal_norm",
+            "second_covariance_linear_norm",
+            "second_covariance_quadratic_norm",
+            "second_covariance_cancellation_ratio",
+            "minimum_qr_diagonal",
+        ):
+            values = _readonly(getattr(self, name), ndim=2, name=name)
+            if values.shape != first.shape:
+                raise ValueError(f"{name} must match first_orbital_norm")
+            object.__setattr__(self, name, values)
+        invariant_residuals = _readonly(
+            self.invariant_residuals, ndim=4, name="invariant_residuals"
+        )
+        expected = first.shape + (4, 3)
+        if invariant_residuals.shape != expected:
+            raise ValueError(
+                "invariant_residuals must have shape "
+                "(n_trajectories, n_steps + 1, 4, 3)"
+            )
+        object.__setattr__(self, "invariant_residuals", invariant_residuals)
+
+
+@dataclass(frozen=True)
 class GaussianChainSecondOrderHistory:
-    """Optional pathwise state and derivative observables for validation."""
+    """Optional pathwise state, derivative, and tangent-growth diagnostics."""
 
     z: np.ndarray
     u: np.ndarray
     v: np.ndarray
+    growth: Optional[GaussianChainTangentGrowthHistory] = None
 
     def __post_init__(self) -> None:
         z = _readonly(self.z, ndim=3, name="z")
@@ -706,6 +827,10 @@ class GaussianChainSecondOrderHistory:
         object.__setattr__(self, "z", z)
         object.__setattr__(self, "u", u)
         object.__setattr__(self, "v", v)
+        if self.growth is not None:
+            expected = z.shape[:2]
+            if self.growth.first_orbital_norm.shape != expected:
+                raise ValueError("growth diagnostics must match z history")
 
 
 @dataclass(frozen=True)
@@ -1458,7 +1583,7 @@ def simulate_gaussian_orbital_chain_second_order(
     occupied = eigenvectors[:, eigenvalues > 0.5]
     if occupied.shape != (2 * L, L):
         raise ValueError("initial covariance does not have rank L")
-    occupied, _ = deterministic_phase_qr(occupied)
+    occupied, initial_r_matrix = deterministic_phase_qr(occupied)
 
     n_steps = n_burnin + n_samples
     noise, recorded_seed = _resolve_gaussian_noise(
@@ -1482,6 +1607,29 @@ def simulate_gaussian_orbital_chain_second_order(
         z_history = np.empty((n_trajectories, n_steps + 1, L), dtype=float)
         u_history = np.empty_like(z_history)
         v_history = np.empty_like(z_history)
+        growth_metric_names = (
+            "first_orbital_norm",
+            "second_orbital_norm",
+            "first_covariance_norm",
+            "second_covariance_norm",
+            "first_within_occupied_norm",
+            "first_horizontal_norm",
+            "second_within_occupied_norm",
+            "second_horizontal_norm",
+            "second_covariance_linear_norm",
+            "second_covariance_quadratic_norm",
+            "second_covariance_cancellation_ratio",
+        )
+        growth_metric_histories = {
+            name: np.empty((n_trajectories, n_steps + 1), dtype=float)
+            for name in growth_metric_names
+        }
+        minimum_qr_diagonal_history = np.empty(
+            (n_trajectories, n_steps + 1), dtype=float
+        )
+        invariant_residual_history = np.empty(
+            (n_trajectories, n_steps + 1, 4, 3), dtype=float
+        )
 
     q_sum = np.zeros(n_trajectories, dtype=float)
     first_q_sum = np.zeros(n_trajectories, dtype=float)
@@ -1525,6 +1673,15 @@ def simulate_gaussian_orbital_chain_second_order(
         diagnostics,
     ):
         maximum[:, :] = current
+    if store_history:
+        initial_growth = gaussian_tangent_growth_metrics(
+            orbitals, first_orbital_tangent, second_orbital_tangent
+        )
+        for name in growth_metric_names:
+            growth_metric_histories[name][:, 0] = initial_growth[name]
+        initial_minimum = float(np.min(np.abs(np.diag(initial_r_matrix))))
+        minimum_qr_diagonal_history[:, 0] = initial_minimum
+        invariant_residual_history[:, 0, :, :] = np.stack(diagnostics, axis=1)
 
     for step in range(n_steps):
         hamiltonian_outputs = apply_orbital_hamiltonian_map(
@@ -1590,6 +1747,18 @@ def simulate_gaussian_orbital_chain_second_order(
             diagnostics,
         ):
             maximum[:, :] = np.maximum(maximum, current)
+        if store_history:
+            growth = gaussian_tangent_growth_metrics(
+                orbitals, first_orbital_tangent, second_orbital_tangent
+            )
+            for name in growth_metric_names:
+                growth_metric_histories[name][:, step + 1] = growth[name]
+            minimum_qr_diagonal_history[:, step + 1] = np.min(
+                np.abs(np.diagonal(r_matrix, axis1=-2, axis2=-1)), axis=-1
+            )
+            invariant_residual_history[:, step + 1, :, :] = np.stack(
+                diagnostics, axis=1
+            )
 
         if step >= n_burnin:
             q_sum += np.mean(1.0 + np.square(z), axis=1)
@@ -1653,9 +1822,15 @@ def simulate_gaussian_orbital_chain_second_order(
         clipping_fired=False,
     )
     if store_history:
+        growth_history = GaussianChainTangentGrowthHistory(
+            **growth_metric_histories,
+            minimum_qr_diagonal=minimum_qr_diagonal_history,
+            invariant_residuals=invariant_residual_history,
+        )
         history = GaussianChainSecondOrderHistory(
             z=z_history,
             u=u_history,
             v=v_history,
+            growth=growth_history,
         )
     return result, history

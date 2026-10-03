@@ -12,6 +12,7 @@ from quantum_measurement.jw_expansion.gaussian_orbital import (
     deterministic_phase_qr,
     deterministic_phase_qr_second_order,
     fermion_annihilation_operators,
+    gaussian_tangent_growth_metrics,
     ising_bdg_hamiltonian,
     ising_spin_hamiltonian,
     nambu_covariance_from_state,
@@ -259,6 +260,26 @@ def test_measurement_qr_tangents_match_common_noise_finite_difference():
         covariance_tangents_from_orbitals(q, q1, q2)
     )
     assert covariance.shape == first_covariance.shape == second_covariance.shape == (6, 6)
+
+
+def test_tangent_growth_metrics_identify_pure_orbital_gauge_motion():
+    orbitals = np.eye(4, 2, dtype=complex)
+    generator = np.array([[0.0, 0.7], [-0.7, 0.0]], dtype=complex)
+    first = orbitals @ generator
+    second = orbitals @ generator @ generator
+
+    metrics = gaussian_tangent_growth_metrics(orbitals, first, second)
+
+    assert metrics["first_orbital_norm"] > 0.0
+    assert metrics["second_orbital_norm"] > 0.0
+    assert metrics["first_within_occupied_norm"] > 0.0
+    assert metrics["second_within_occupied_norm"] > 0.0
+    np.testing.assert_allclose(metrics["first_horizontal_norm"], 0.0)
+    np.testing.assert_allclose(metrics["second_horizontal_norm"], 0.0)
+    np.testing.assert_allclose(metrics["first_covariance_norm"], 0.0)
+    np.testing.assert_allclose(metrics["second_covariance_norm"], 0.0)
+    assert metrics["second_covariance_linear_norm"] > 0.0
+    assert metrics["second_covariance_quadratic_norm"] > 0.0
 
 
 @pytest.mark.parametrize("boundary", ["open", "periodic"])
@@ -559,6 +580,12 @@ def test_second_order_chain_matches_common_noise_finite_difference(L):
         / (h * h),
         atol=2.0e-8,
     )
+    assert history.growth is not None
+    assert history.growth.first_orbital_norm.shape == (2, 13)
+    assert history.growth.invariant_residuals.shape == (2, 13, 4, 3)
+    assert np.all(np.isfinite(history.growth.minimum_qr_diagonal))
+    with pytest.raises(ValueError, match="read-only"):
+        history.growth.second_covariance_norm[0, 0] = 0.0
 
 
 def test_second_order_chain_result_schema_invariants_and_no_repair_policy():
@@ -679,6 +706,34 @@ def test_exact_reference_derivative_errors_show_second_order_h_convergence():
     errors = np.asarray(errors)
     np.testing.assert_array_less(errors[1:], errors[:-1])
     np.testing.assert_array_less(3.5, errors[:-1] / errors[1:])
+
+
+def test_second_order_observables_refine_on_coupled_brownian_path():
+    L = 2
+    fine_dt = 0.00125
+    fine_steps = 160
+    fine_noise = np.random.default_rng(991).standard_normal((4, fine_steps, L))
+    results = []
+    for factor in (4, 2, 1):
+        result, _ = simulate_gaussian_orbital_chain_second_order(
+            L=L,
+            gamma=0.4,
+            J=1.0,
+            dt=fine_dt * factor,
+            n_burnin=0,
+            n_samples=fine_steps // factor,
+            boundary="periodic",
+            noise=coarsen_standard_normal_noise(fine_noise, factor),
+        )
+        results.append(result)
+
+    finest = results[-1]
+    for field in ("q", "dq_dtheta", "d2q_dtheta2"):
+        errors = [
+            np.sqrt(np.mean(np.square(getattr(result, field) - getattr(finest, field))))
+            for result in results[:-1]
+        ]
+        assert errors[1] < errors[0]
 
 
 def test_second_order_chain_rejects_ambiguous_noise_and_replays_seed():
