@@ -1,6 +1,13 @@
 from .sweep_executor import ParameterSweepExecutor
 from .trajectory_worker import TrajectoryConfig, TrajectoryTask
 from .validation import ValidationResult, validate_worker0_matches_reference
+from .run_profiles import (
+    LEGACY_PROFILE,
+    PROFILE_SCHEMA_VERSION,
+    TANGENT_GUARDED_PROFILE,
+    TangentSchedule,
+    resolve_tangent_schedule,
+)
 
 # Hybrid imports are optional to avoid circular initialization with backend modules.
 try:
@@ -29,4 +36,9 @@ __all__ = [
     "TrajectoryTask",
     "ValidationResult",
     "validate_worker0_matches_reference",
+    "LEGACY_PROFILE",
+    "PROFILE_SCHEMA_VERSION",
+    "TANGENT_GUARDED_PROFILE",
+    "TangentSchedule",
+    "resolve_tangent_schedule",
 ]

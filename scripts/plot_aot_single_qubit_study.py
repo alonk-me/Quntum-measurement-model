@@ -161,6 +161,7 @@ def render(output_dir: Path, output_path: Path) -> None:
 
     snapshot = {
         "status": state,
+        "profile": config.get("profile", "legacy") if isinstance(config, dict) else "legacy",
         "completed_batches": completed,
         "expected_batches": expected,
         "aggregate_points": len(rows),

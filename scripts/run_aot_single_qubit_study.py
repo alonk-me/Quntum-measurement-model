@@ -29,10 +29,17 @@ from quantum_measurement.aot_single_qubit import (
     mean_and_sem,
     validate_aot_second_order_finite_difference,
 )
+from quantum_measurement.parallel.run_profiles import (
+    LEGACY_PROFILE,
+    TANGENT_GUARDED_PROFILE,
+    TangentSchedule,
+    resolve_tangent_schedule,
+)
 
 SCHEMA_VERSION = 1
 CSV_FIELDS = (
-    "gamma", "dt", "h", "batch_index", "batch_seed", "J", "n_trajectories", "n_burnin", "n_samples",
+    "gamma", "requested_dt", "dt", "h", "profile_name", "profile_version", "schedule_fingerprint",
+    "decision_state", "decision_reason", "parent_fingerprint", "batch_index", "batch_seed", "J", "n_trajectories", "n_burnin", "n_samples",
     "dq_mean", "dq_sem", "d2q_mean", "d2q_sem", "fd_dq_mean", "fd_dq_sem",
     "fd_d2q_mean", "fd_d2q_sem", "dq_rms_error", "d2q_rms_error",
     "dQ_mean", "d2Q_mean", "fd_dQ_mean", "fd_d2Q_mean",
@@ -42,7 +49,8 @@ CSV_FIELDS = (
     "max_second_constraint_error", "noise_hash", "seed",
 )
 AGGREGATE_FIELDS = (
-    "gamma", "dt", "h", "n_batches", "dq_mean", "dq_sem", "d2q_mean", "d2q_sem",
+    "gamma", "requested_dt", "dt", "h", "profile_name", "profile_version", "schedule_fingerprint",
+    "decision_state", "n_batches", "dq_mean", "dq_sem", "d2q_mean", "d2q_sem",
     "fd_dq_mean", "fd_dq_sem", "fd_d2q_mean", "fd_d2q_sem", "dq_rms_error",
     "d2q_rms_error", "dQ_mean", "d2Q_mean", "fd_dQ_mean", "fd_d2Q_mean",
     "dQ_rms_error", "d2Q_rms_error", "max_first_tangent_norm", "max_second_tangent_norm",
@@ -63,6 +71,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--n-burnin", type=int, default=100)
     parser.add_argument("--n-samples", type=int, default=400)
     parser.add_argument("--seed", type=int, default=20261003)
+    parser.add_argument(
+        "--profile",
+        choices=(LEGACY_PROFILE, TANGENT_GUARDED_PROFILE),
+        default=LEGACY_PROFILE,
+    )
+    parser.add_argument("--profile-max-second-tangent-norm", type=float, default=1.0e3)
+    parser.add_argument("--profile-max-second-tangent-sem", type=float, default=10.0)
+    parser.add_argument("--profile-dt-min", type=float, default=1.0e-6)
+    parser.add_argument("--profile-horizon-reduction", type=float, default=0.5)
     parser.add_argument("--max-first-tangent-norm", type=float, default=1.0e6)
     parser.add_argument("--max-second-tangent-norm", type=float, default=1.0e8)
     return parser.parse_args()
@@ -103,6 +120,38 @@ def _append_csv(path: Path, row: dict[str, object]) -> None:
         os.fsync(handle.fileno())
 
 
+def _load_records(path: Path) -> dict[str, dict[str, object]]:
+    records = {}
+    if not path.exists():
+        return records
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            record = json.loads(line)
+            records[str(record["key"])] = record["row"]
+    return records
+
+
+def _load_decisions(path: Path) -> dict[tuple[float, float, int], dict[str, object]]:
+    decisions = {}
+    if not path.exists():
+        return decisions
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        decisions[
+            (float(record["gamma"]), float(record["requested_dt"]), int(record["batch_index"]))
+        ] = record
+    return decisions
+
+
+def _append_jsonl(path: Path, record: dict[str, object]) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def _write_aggregates(records_path: Path, aggregate_path: Path) -> None:
     grouped: dict[tuple[float, float, float], list[dict[str, object]]] = {}
     if records_path.exists():
@@ -110,7 +159,16 @@ def _write_aggregates(records_path: Path, aggregate_path: Path) -> None:
             if not line.strip():
                 continue
             record = json.loads(line)["row"]
-            key = (float(record["gamma"]), float(record["dt"]), float(record["h"]))
+            key = (
+                float(record["gamma"]),
+                float(record["requested_dt"]),
+                float(record["dt"]),
+                float(record["h"]),
+                record["profile_name"],
+                int(record["profile_version"]),
+                record["schedule_fingerprint"],
+                record["decision_state"],
+            )
             grouped.setdefault(key, []).append(record)
 
     rows = []
@@ -122,8 +180,18 @@ def _write_aggregates(records_path: Path, aggregate_path: Path) -> None:
         "max_second_constraint_error", "tangent_seconds", "finite_difference_seconds",
         "runtime_ratio",
     )
-    for (gamma, dt, h), records in sorted(grouped.items()):
-        row = {"gamma": gamma, "dt": dt, "h": h, "n_batches": len(records)}
+    for (gamma, requested_dt, dt, h, profile_name, profile_version, schedule_fingerprint, decision_state), records in sorted(grouped.items()):
+        row = {
+            "gamma": gamma,
+            "requested_dt": requested_dt,
+            "dt": dt,
+            "h": h,
+            "profile_name": profile_name,
+            "profile_version": profile_version,
+            "schedule_fingerprint": schedule_fingerprint,
+            "decision_state": decision_state,
+            "n_batches": len(records),
+        }
         for field in mean_fields:
             values = np.asarray([float(record[field]) for record in records])
             row[field] = float(np.mean(values))
@@ -158,6 +226,13 @@ def main() -> None:
         raise ValueError("gamma, dt, and h values must be positive")
     if args.J < 0 or args.n_trajectories <= 0 or args.n_batches <= 0 or args.n_burnin < 0 or args.n_samples <= 0:
         raise ValueError("invalid J, trajectory, burn-in, or sample configuration")
+    if (
+        args.profile_max_second_tangent_norm <= 0.0
+        or args.profile_max_second_tangent_sem <= 0.0
+        or args.profile_dt_min <= 0.0
+        or not 0.0 < args.profile_horizon_reduction <= 1.0
+    ):
+        raise ValueError("invalid adaptive profile guardrails")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     configuration = {
@@ -171,6 +246,11 @@ def main() -> None:
         "n_burnin": args.n_burnin,
         "n_samples": args.n_samples,
         "seed": args.seed,
+        "profile": args.profile,
+        "profile_max_second_tangent_norm": args.profile_max_second_tangent_norm,
+        "profile_max_second_tangent_sem": args.profile_max_second_tangent_sem,
+        "profile_dt_min": args.profile_dt_min,
+        "profile_horizon_reduction": args.profile_horizon_reduction,
         "finite_difference_role": "short_common_noise_validation_only",
     }
     fingerprint = _fingerprint(configuration)
@@ -179,6 +259,7 @@ def main() -> None:
     rows_path = args.output_dir / "step_size_summary.csv"
     aggregate_path = args.output_dir / "aggregate_summary.csv"
     records_path = args.output_dir / "records.jsonl"
+    decisions_path = args.output_dir / "profile_decisions.jsonl"
 
     if configuration_path.exists():
         existing = json.loads(configuration_path.read_text(encoding="utf-8"))
@@ -196,34 +277,69 @@ def main() -> None:
         if manifest.get("fingerprint") != fingerprint:
             raise RuntimeError("manifest fingerprint does not match configuration")
     completed = set(manifest.get("completed", []))
+    existing_records = _load_records(records_path)
+    decisions = _load_decisions(decisions_path)
     total_blocks = len(args.gamma_values) * len(args.dt_values) * len(args.h_values) * args.n_batches
 
     from quantum_measurement.aot_single_qubit import rademacher_noise
 
     block_number = 0
     for gamma_index, gamma in enumerate(args.gamma_values):
-        for dt_index, dt in enumerate(args.dt_values):
+        for dt_index, requested_dt in enumerate(args.dt_values):
             for batch_index in range(args.n_batches):
+                previous_decision = decisions.get((gamma, requested_dt, batch_index - 1))
+                if previous_decision is not None:
+                    schedule = TangentSchedule.from_dict(previous_decision["next_schedule"])
+                elif batch_index == 0:
+                    schedule = resolve_tangent_schedule(
+                        gamma=gamma,
+                        J=args.J,
+                        dt=requested_dt,
+                        n_burnin=args.n_burnin,
+                        n_samples=args.n_samples,
+                        profile_name=args.profile,
+                    )
+                elif args.profile == LEGACY_PROFILE:
+                    schedule = resolve_tangent_schedule(
+                        gamma=gamma,
+                        J=args.J,
+                        dt=requested_dt,
+                        n_burnin=args.n_burnin,
+                        n_samples=args.n_samples,
+                        profile_name=args.profile,
+                    )
+                else:
+                    raise RuntimeError(
+                        f"missing profile decision for gamma={gamma:g}, requested_dt={requested_dt:g}, "
+                        f"previous batch={batch_index - 1}"
+                    )
+
                 noise_seed = args.seed + gamma_index * 100003 + dt_index * 1009 + batch_index
                 noise = rademacher_noise(
                     args.n_trajectories,
-                    args.n_burnin + args.n_samples,
+                    schedule.n_steps,
                     noise_seed,
                 )
+                batch_rows = []
                 for h in args.h_values:
-                    key = f"gamma={gamma:g}|dt={dt:g}|h={h:g}|batch={batch_index}"
+                    key = f"gamma={gamma:g}|dt={requested_dt:g}|h={h:g}|batch={batch_index}"
+                    if args.profile != LEGACY_PROFILE:
+                        key += f"|schedule={schedule.fingerprint}"
                     block_number += 1
                     if key in completed:
                         print(f"SKIP {block_number}/{total_blocks} {key}", flush=True)
+                        if key not in existing_records:
+                            raise RuntimeError(f"manifest references missing record for {key}")
+                        batch_rows.append(existing_records[key])
                         continue
 
                     started = perf_counter()
                     validation = validate_aot_second_order_finite_difference(
                         gamma=gamma,
                         J=args.J,
-                        dt=dt,
-                        n_burnin=args.n_burnin,
-                        n_samples=args.n_samples,
+                        dt=schedule.dt,
+                        n_burnin=schedule.n_burnin,
+                        n_samples=schedule.n_samples,
                         h=h,
                         noise=noise,
                     )
@@ -238,7 +354,14 @@ def main() -> None:
                     dQ_error = tangent.dQ_dtheta - validation.finite_difference_dQ_dtheta
                     d2Q_error = tangent.d2Q_dtheta2 - validation.finite_difference_d2Q_dtheta2
                     row = {
-                        "gamma": gamma, "dt": dt, "h": h, "batch_index": batch_index,
+                        "gamma": gamma, "requested_dt": requested_dt, "dt": schedule.dt, "h": h,
+                        "profile_name": schedule.profile_name,
+                        "profile_version": schedule.profile_version,
+                        "schedule_fingerprint": schedule.fingerprint,
+                        "decision_state": schedule.decision_state,
+                        "decision_reason": schedule.decision_reason,
+                        "parent_fingerprint": schedule.parent_fingerprint,
+                        "batch_index": batch_index,
                         "batch_seed": noise_seed, "J": args.J,
                         "n_trajectories": args.n_trajectories, "n_burnin": args.n_burnin,
                         "n_samples": args.n_samples, "dq_mean": dq_mean, "dq_sem": dq_sem,
@@ -267,12 +390,11 @@ def main() -> None:
                     if row["max_second_tangent_norm"] > args.max_second_tangent_norm:
                         raise RuntimeError(f"second tangent guardrail exceeded at {key}")
                     record = {"key": key, "row": row, "configuration_fingerprint": fingerprint}
-                    with records_path.open("a", encoding="utf-8") as handle:
-                        handle.write(json.dumps(record) + "\n")
-                        handle.flush()
-                        os.fsync(handle.fileno())
+                    _append_jsonl(records_path, record)
                     _append_csv(rows_path, row)
                     _write_aggregates(records_path, aggregate_path)
+                    existing_records[key] = row
+                    batch_rows.append(row)
                     completed.add(key)
                     manifest["completed"] = sorted(completed)
                     manifest["last_completed"] = key
@@ -284,6 +406,50 @@ def main() -> None:
                         f"dq_rms={row['dq_rms_error']:.3g} d2q_rms={row['d2q_rms_error']:.3g}",
                         flush=True,
                     )
+
+                if args.profile != LEGACY_PROFILE:
+                    diagnostics = {
+                        "max_second_tangent_norm": max(
+                            float(row["max_second_tangent_norm"]) for row in batch_rows
+                        ),
+                        "max_first_tangent_norm": max(
+                            float(row["max_first_tangent_norm"]) for row in batch_rows
+                        ),
+                        "d2q_sem": max(float(row["d2q_sem"]) for row in batch_rows),
+                        "max_second_constraint_error": max(
+                            float(row["max_second_constraint_error"]) for row in batch_rows
+                        ),
+                    }
+                    next_schedule = resolve_tangent_schedule(
+                        gamma=gamma,
+                        J=args.J,
+                        dt=schedule.dt,
+                        n_burnin=schedule.n_burnin,
+                        n_samples=schedule.n_samples,
+                        profile_name=args.profile,
+                        diagnostics=diagnostics,
+                        max_second_tangent_norm=args.profile_max_second_tangent_norm,
+                        max_second_tangent_sem=args.profile_max_second_tangent_sem,
+                        dt_min=args.profile_dt_min,
+                        horizon_reduction=args.profile_horizon_reduction,
+                    )
+                    decision_key = (gamma, requested_dt, batch_index)
+                    decision = {
+                        "gamma": gamma,
+                        "requested_dt": requested_dt,
+                        "batch_index": batch_index,
+                        "configuration_fingerprint": fingerprint,
+                        "schedule": schedule.to_dict(),
+                        "diagnostics": diagnostics,
+                        "next_schedule": next_schedule.to_dict(),
+                        "transition": next_schedule.decision_state,
+                        "reason": next_schedule.decision_reason,
+                    }
+                    if decision_key not in decisions:
+                        _append_jsonl(decisions_path, decision)
+                        decisions[decision_key] = decision
+                    manifest["last_profile_decision"] = decision
+                    _atomic_write_json(manifest_path, manifest)
 
     manifest["status"] = "complete" if len(completed) == total_blocks else "partial"
     _atomic_write_json(manifest_path, manifest)

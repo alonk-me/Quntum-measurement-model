@@ -109,6 +109,7 @@ def _status(output_dir: Path, stale_after: float) -> None:
     alive = _alive(int(pid)) if pid else False
     completed = manifest.get("completed", []) if isinstance(manifest, dict) else []
     config = configuration.get("configuration", {}) if isinstance(configuration, dict) else {}
+    profile = config.get("profile", "legacy") if isinstance(config, dict) else "legacy"
     expected = (
         len(config.get("gamma_values", []))
         * len(config.get("dt_values", []))
@@ -123,6 +124,13 @@ def _status(output_dir: Path, stale_after: float) -> None:
     status = manifest.get("status", "not_started") if isinstance(manifest, dict) else "not_started"
     print(f"process={'alive' if alive else 'not_alive'} pid={pid or '-'}")
     print(f"study_status={status} completed={len(completed)}/{expected}")
+    print(f"profile={profile}")
+    if isinstance(manifest, dict) and manifest.get("last_profile_decision"):
+        decision = manifest["last_profile_decision"]
+        print(
+            f"last_profile_transition={decision.get('transition', '-')} "
+            f"reason={decision.get('reason', '-') }"
+        )
     print(f"last_completed={manifest.get('last_completed', '-') if isinstance(manifest, dict) else '-'}")
     print(f"last_update_age_seconds={age:.1f}" if age is not None else "last_update_age_seconds=-")
     print(f"freshness={'STALE' if stale else 'ok'}")

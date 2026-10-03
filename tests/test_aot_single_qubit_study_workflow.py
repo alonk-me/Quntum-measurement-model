@@ -111,3 +111,39 @@ def test_monitor_reads_completed_study(tmp_path):
     snapshot = json.loads((tmp_path / "live_progress.json").read_text())
     assert snapshot["status"] == "COMPLETE"
     assert snapshot["completed_batches"] == 2
+
+
+def test_guarded_profile_persists_and_reuses_transition(tmp_path):
+    command = _study_command(tmp_path) + [
+        "--profile",
+        "tangent_guarded_v1",
+        "--profile-max-second-tangent-norm",
+        "0.000001",
+    ]
+    first = subprocess.run(
+        command,
+        cwd=REPOSITORY_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "STUDY_COMPLETE completed=2/2" in first.stdout
+
+    decisions = [
+        json.loads(line)
+        for line in (tmp_path / "profile_decisions.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert len(decisions) == 2
+    assert decisions[0]["transition"] in {"refined_dt", "shortened_horizon"}
+    assert decisions[1]["schedule"]["fingerprint"] != decisions[0]["schedule"]["fingerprint"]
+
+    second = subprocess.run(
+        command,
+        cwd=REPOSITORY_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "STUDY_COMPLETE completed=2/2" in second.stdout
+    assert len((tmp_path / "profile_decisions.jsonl").read_text().splitlines()) == 2
