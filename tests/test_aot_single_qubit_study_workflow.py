@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DRIVER = REPOSITORY_ROOT / "scripts" / "run_aot_single_qubit_study.py"
@@ -137,6 +139,32 @@ def test_guarded_profile_persists_and_reuses_transition(tmp_path):
     assert len(decisions) == 2
     assert decisions[0]["transition"] in {"refined_dt", "shortened_horizon"}
     assert decisions[1]["schedule"]["fingerprint"] != decisions[0]["schedule"]["fingerprint"]
+
+    producing_schedules = {
+        0: decisions[0]["schedule"],
+        1: decisions[0]["next_schedule"],
+    }
+    rows = [
+        json.loads(line)["row"]
+        for line in (tmp_path / "records.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == 2
+    for row in rows:
+        schedule = producing_schedules[row["batch_index"]]
+        assert row["schedule_fingerprint"] == schedule["fingerprint"]
+        assert row["dt"] == schedule["dt"]
+        assert row["n_burnin"] == schedule["n_burnin"]
+        assert row["n_samples"] == schedule["n_samples"]
+        assert row["n_samples"] * row["dt"] == pytest.approx(schedule["sampling_time"])
+    refined = next(row for row in rows if row["batch_index"] == 1)
+    assert refined["dt"] < rows[0]["dt"]
+    assert (refined["n_burnin"], refined["n_samples"]) != (rows[0]["n_burnin"], rows[0]["n_samples"])
+    with (tmp_path / "step_size_summary.csv").open(newline="") as handle:
+        csv_rows = list(csv.DictReader(handle))
+    for csv_row, row in zip(csv_rows, rows):
+        assert int(csv_row["n_burnin"]) == row["n_burnin"]
+        assert int(csv_row["n_samples"]) == row["n_samples"]
 
     second = subprocess.run(
         command,

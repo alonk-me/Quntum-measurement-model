@@ -36,7 +36,7 @@ from quantum_measurement.parallel.run_profiles import (
     resolve_tangent_schedule,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 CSV_FIELDS = (
     "gamma", "requested_dt", "dt", "h", "profile_name", "profile_version", "schedule_fingerprint",
     "decision_state", "decision_reason", "parent_fingerprint", "batch_index", "batch_seed", "J", "n_trajectories", "n_burnin", "n_samples",
@@ -153,7 +153,7 @@ def _append_jsonl(path: Path, record: dict[str, object]) -> None:
 
 
 def _write_aggregates(records_path: Path, aggregate_path: Path) -> None:
-    grouped: dict[tuple[float, float, float], list[dict[str, object]]] = {}
+    grouped: dict[tuple[object, ...], list[dict[str, object]]] = {}
     if records_path.exists():
         for line in records_path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
@@ -363,8 +363,8 @@ def main() -> None:
                         "parent_fingerprint": schedule.parent_fingerprint,
                         "batch_index": batch_index,
                         "batch_seed": noise_seed, "J": args.J,
-                        "n_trajectories": args.n_trajectories, "n_burnin": args.n_burnin,
-                        "n_samples": args.n_samples, "dq_mean": dq_mean, "dq_sem": dq_sem,
+                        "n_trajectories": args.n_trajectories, "n_burnin": schedule.n_burnin,
+                        "n_samples": schedule.n_samples, "dq_mean": dq_mean, "dq_sem": dq_sem,
                         "d2q_mean": d2q_mean, "d2q_sem": d2q_sem, "fd_dq_mean": fd_dq_mean,
                         "fd_dq_sem": fd_dq_sem, "fd_d2q_mean": fd_d2q_mean, "fd_d2q_sem": fd_d2q_sem,
                         "dq_rms_error": float(np.sqrt(np.mean(dq_error ** 2))),

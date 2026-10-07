@@ -20,12 +20,14 @@ from time import perf_counter
 
 import numpy as np
 import scipy
+import scipy.stats
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from quantum_measurement.jw_expansion.gaussian_orbital import (
+    coarsen_standard_normal_noise,
     simulate_exact_small_chain,
     simulate_gaussian_orbital_chain,
     simulate_gaussian_orbital_chain_second_order,
@@ -49,6 +51,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fd-trajectories", type=int, default=2)
     parser.add_argument("--exact-control-trajectories", type=int, default=2)
     parser.add_argument("--record-stride", type=int, default=10)
+    parser.add_argument(
+        "--coarsening-factor",
+        type=int,
+        default=1,
+        help=(
+            "Replay the coupled coarse path: noise is generated at --dt and "
+            "coarsened by this factor, so the run uses dt*factor."
+        ),
+    )
     parser.add_argument("--skip-finite-difference", action="store_true")
     parser.add_argument("--skip-exact-control", action="store_true")
     parser.add_argument(
@@ -81,10 +92,16 @@ def _validate(args: argparse.Namespace) -> tuple[int, int]:
         raise ValueError("all h-values must be positive")
     if args.record_stride < 1:
         raise ValueError("record-stride must be positive")
+    if args.coarsening_factor < 1:
+        raise ValueError("coarsening-factor must be positive")
     burn_in = _step_count(args.burn_in_time, args.dt, "burn-in-time")
     samples = _step_count(args.sample_time, args.dt, "sample-time")
     if samples < 1:
         raise ValueError("sample-time must include at least one step")
+    if burn_in % args.coarsening_factor or samples % args.coarsening_factor:
+        raise ValueError(
+            "coarsening-factor must divide the fine burn-in and sample step counts"
+        )
     return burn_in, samples
 
 
@@ -129,7 +146,49 @@ def _threshold_times(values: np.ndarray, dt: float) -> dict[str, list[object]]:
     return output
 
 
-def _growth_summary(result, history, dt: float, n_burnin: int) -> dict[str, object]:
+def _step_jump_size(z_history: np.ndarray) -> np.ndarray:
+    """Return the site-maximum ``|z_t - z_{t-1}|`` per step (zero at step 0)."""
+
+    jumps = np.zeros(z_history.shape[:2], dtype=float)
+    jumps[:, 1:] = np.max(np.abs(np.diff(z_history, axis=1)), axis=-1)
+    return jumps
+
+
+def _windowed_maximum(values: np.ndarray, window: int) -> np.ndarray:
+    """Maximum over consecutive non-overlapping step windows, per trajectory."""
+
+    n_windows = values.shape[1] // window
+    trimmed = values[:, : n_windows * window]
+    return trimmed.reshape(values.shape[0], n_windows, window).max(axis=2)
+
+
+def _jump_alignment(history, window: int) -> dict[str, object]:
+    """Rank-correlate windowed second-tangent peaks with fast ``z`` transitions."""
+
+    jump = _windowed_maximum(_step_jump_size(history.z), window)
+    second = _windowed_maximum(np.max(np.abs(history.v), axis=-1), window)
+    correlations = []
+    for jump_values, second_values in zip(jump, second):
+        if jump_values.size < 3 or np.ptp(jump_values) == 0.0 or np.ptp(second_values) == 0.0:
+            correlations.append(None)
+            continue
+        correlation = scipy.stats.spearmanr(jump_values, second_values).correlation
+        correlations.append(float(correlation))
+    peak_windows = np.argmax(second, axis=1)
+    jump_rank_at_peak = [
+        float(np.mean(trajectory <= trajectory[index]))
+        for trajectory, index in zip(jump, peak_windows)
+    ]
+    return {
+        "window_steps": window,
+        "spearman_max_abs_v_vs_max_abs_dz": correlations,
+        "jump_quantile_at_max_abs_v_window": jump_rank_at_peak,
+    }
+
+
+def _growth_summary(
+    result, history, dt: float, n_burnin: int, window: int
+) -> dict[str, object]:
     growth = history.growth
     if growth is None:
         raise RuntimeError("tangent-growth history was not recorded")
@@ -177,6 +236,7 @@ def _growth_summary(result, history, dt: float, n_burnin: int) -> dict[str, obje
         "d2q_reconstruction_error": float(
             np.max(np.abs(result.d2q_dtheta2 - positive - signed))
         ),
+        "jump_alignment": _jump_alignment(history, window),
     }
 
 
@@ -255,7 +315,7 @@ def _finite_difference_sweep(
                     history.v, finite_v, common["dt"]
                 ),
                 "finite_d2q": finite_d2q.tolist(),
-                "direct_d2q": tangent.d2q_dtheta.tolist(),
+                "direct_d2q": tangent.d2q_dtheta2.tolist(),
                 "finite_F2_norm": np.linalg.norm(
                     finite_F2, axis=(-2, -1)
                 ).tolist(),
@@ -300,6 +360,7 @@ def _write_timeseries(
     steps = list(range(0, history.z.shape[1], stride))
     if steps[-1] != history.z.shape[1] - 1:
         steps.append(history.z.shape[1] - 1)
+    step_jumps = _step_jump_size(history.z)
     metric_names = (
         "first_orbital_norm",
         "second_orbital_norm",
@@ -322,6 +383,7 @@ def _write_timeseries(
         "max_abs_z",
         "max_abs_u",
         "max_abs_v",
+        "max_abs_dz_window",
         "instantaneous_2u2",
         "instantaneous_2zv",
         *metric_names,
@@ -333,7 +395,10 @@ def _write_timeseries(
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for trajectory in range(history.z.shape[0]):
+            previous_step = 0
             for step in steps:
+                window_start = previous_step + 1 if step > 0 else 0
+                previous_step = step
                 row = {
                     "run": label,
                     "trajectory": trajectory,
@@ -342,6 +407,9 @@ def _write_timeseries(
                     "max_abs_z": np.max(np.abs(history.z[trajectory, step])),
                     "max_abs_u": np.max(np.abs(history.u[trajectory, step])),
                     "max_abs_v": np.max(np.abs(history.v[trajectory, step])),
+                    "max_abs_dz_window": np.max(
+                        step_jumps[trajectory, window_start : step + 1]
+                    ),
                     "instantaneous_2u2": 2.0
                     * np.mean(np.square(history.u[trajectory, step])),
                     "instantaneous_2zv": 2.0
@@ -393,18 +461,24 @@ def _sha256(path: Path) -> str:
 
 def main() -> None:
     args = parse_args()
-    n_burnin, n_samples = _validate(args)
-    n_steps = n_burnin + n_samples
+    fine_burnin, fine_samples = _validate(args)
+    factor = args.coarsening_factor
+    n_burnin = fine_burnin // factor
+    n_samples = fine_samples // factor
+    dt = args.dt * factor
     args.output_dir.mkdir(parents=True, exist_ok=True)
     gamma = 4.0 * args.J * args.g
-    noise = np.random.default_rng(args.seed).standard_normal(
-        (args.n_trajectories, n_steps, args.L)
+    # The fine path is generated exactly as by the timestep validation, so a
+    # factor > 1 replays its coupled coarse Brownian increments.
+    fine_noise = np.random.default_rng(args.seed).standard_normal(
+        (args.n_trajectories, fine_burnin + fine_samples, args.L)
     )
+    noise = coarsen_standard_normal_noise(fine_noise, factor)
     common = {
         "L": args.L,
         "gamma": gamma,
         "J": args.J,
-        "dt": args.dt,
+        "dt": dt,
         "n_burnin": n_burnin,
         "n_samples": n_samples,
         "boundary": args.boundary,
@@ -416,7 +490,9 @@ def main() -> None:
     )
     primary_seconds = perf_counter() - start
     selected = _select_trajectories(history, args.fd_trajectories)
-    primary_summary = _growth_summary(tangent, history, args.dt, n_burnin)
+    primary_summary = _growth_summary(
+        tangent, history, dt, n_burnin, args.record_stride
+    )
     primary_summary["selected_finite_difference_trajectories"] = selected
     primary_summary["seconds"] = primary_seconds
     print(
@@ -471,7 +547,7 @@ def main() -> None:
                 - exact_central.final_covariance
             ),
             "growth": _growth_summary(
-                control_tangent, control_history, args.dt, n_burnin
+                control_tangent, control_history, dt, n_burnin, args.record_stride
             ),
             "finite_difference": _finite_difference_sweep(
                 runner=simulate_exact_small_chain,
@@ -493,22 +569,27 @@ def main() -> None:
         )
 
     primary_csv = args.output_dir / "primary_tangent_timeseries.csv"
-    _write_timeseries(primary_csv, history, args.dt, args.record_stride, "primary")
+    _write_timeseries(primary_csv, history, dt, args.record_stride, "primary")
     control_csv = None
     if control_history is not None:
         control_csv = args.output_dir / "exact_control_tangent_timeseries.csv"
         _write_timeseries(
-            control_csv, control_history, args.dt, args.record_stride, "exact_control"
+            control_csv, control_history, dt, args.record_stride, "exact_control"
         )
 
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "configuration": {
             "L": args.L,
             "g": args.g,
             "gamma": gamma,
             "J": args.J,
-            "dt": args.dt,
+            "dt": dt,
+            "fine_dt": args.dt,
+            "coarsening_factor": factor,
+            "noise_seed": args.seed,
+            "noise_kind": "standard_normal_coarsened_from_fine_seed",
+            "noise_hash": tangent.noise_hash,
             "burn_in_time": args.burn_in_time,
             "sample_time": args.sample_time,
             "n_burnin": n_burnin,
